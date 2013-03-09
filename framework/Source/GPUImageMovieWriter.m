@@ -30,8 +30,11 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
     GLubyte *frameData;
     
     CMTime startTime, previousFrameTime;
+    CMTime originalTime, durationTime;
+    BOOL saveDurationTime;
     
     BOOL isRecording;
+    BOOL isPause;
 }
 
 // Movie recording
@@ -80,6 +83,8 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
     movieURL = newMovieURL;
     fileType = newFileType;
     startTime = kCMTimeInvalid;
+    isPause = NO;
+    originalTime = kCMTimeZero;
     _encodingLiveVideo = YES;
     previousFrameTime = kCMTimeNegativeInfinity;
     inputRotation = kGPUImageNoRotation;
@@ -232,7 +237,14 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
 - (void)startRecording;
 {
     isRecording = YES;
-    startTime = kCMTimeInvalid;
+    if (isPause) {
+        isPause = NO;
+        startTime = kCMTimeZero;
+    }
+    else {
+        durationTime = kCMTimeZero;
+        startTime = kCMTimeInvalid;
+    }
 	//    [assetWriter startWriting];
     
 	//    [assetWriter startSessionAtSourceTime:kCMTimeZero];
@@ -267,13 +279,23 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
 
 - (void)finishRecordingWithCompletionHandler:(void (^)(void))handler;
 {
+    //must call this method in other thread than main. Let user choose
+    NSAssert(![NSThread mainThread], @"must call this method in other thread than main");
+    
     if (assetWriter.status == AVAssetWriterStatusCompleted)
     {
         return;
     }
 
     isRecording = NO;
-    runOnMainQueueWithoutDeadlocking(^{
+    isPause = NO;
+
+    if ([assetWriter finishWriting]) {
+        if (handler) {
+            handler();
+        }
+    }
+    /*runOnMainQueueWithoutDeadlocking(^{
         [assetWriterVideoInput markAsFinished];
         [assetWriterAudioInput markAsFinished];
 #if (!defined(__IPHONE_6_0) || (__IPHONE_OS_VERSION_MAX_ALLOWED < __IPHONE_6_0))
@@ -292,13 +314,24 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
             if (handler) handler();
         }
 #endif
-    });
+    });*/
 }
 
 - (void)processAudioBuffer:(CMSampleBufferRef)audioBuffer;
 {
     if (!isRecording)
     {
+        /*if (savePauseTime) {
+            savePauseTime = NO;
+            CMTime currentSampleTime = CMSampleBufferGetOutputPresentationTimeStamp(audioBuffer);
+            [assetWriter endSessionAtSourceTime:currentSampleTime];
+            pauseTime = CMTimeSubtract(currentSampleTime, originalTime);
+        }*/
+        if (saveDurationTime) {
+            saveDurationTime = NO;
+            CMTime currentSampleTime = CMSampleBufferGetOutputPresentationTimeStamp(audioBuffer);
+            durationTime = CMTimeAdd(durationTime, CMTimeSubtract(currentSampleTime, startTime));
+        }
         return;
     }
     
@@ -314,6 +347,12 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
             }
             [assetWriter startSessionAtSourceTime:currentSampleTime];
             startTime = currentSampleTime;
+            originalTime = currentSampleTime;
+        }
+        else if (CMTimeCompare(startTime, kCMTimeZero)==0) {
+            [assetWriter startSessionAtSourceTime:currentSampleTime];
+            startTime = currentSampleTime;
+            //pauseTime = originalTime;
         }
 
         if (!assetWriterAudioInput.readyForMoreMediaData)
@@ -340,6 +379,13 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
         [assetWriterAudioInput requestMediaDataWhenReadyOnQueue:[GPUImageOpenGLESContext sharedOpenGLESQueue] usingBlock:audioInputReadyCallback];
     }        
     
+}
+
+- (void)pause
+{
+    isRecording = NO;
+    isPause = YES;
+    saveDurationTime = YES;
 }
 
 #pragma mark -
@@ -491,6 +537,15 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
 {
     if (!isRecording)
     {
+        /*if (savePauseTime) {
+            savePauseTime = NO;
+            [assetWriter endSessionAtSourceTime:frameTime];
+            pauseTime = CMTimeSubtract(frameTime, originalTime);
+        }*/
+        if (saveDurationTime) {
+            saveDurationTime = NO;
+            durationTime = CMTimeAdd(durationTime, CMTimeSubtract(frameTime, startTime));
+        }
         return;
     }
 
@@ -508,6 +563,12 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
             [assetWriter startWriting];
         }
         
+        [assetWriter startSessionAtSourceTime:frameTime];
+        startTime = frameTime;
+        //pauseTime = frameTime;
+        originalTime = frameTime;
+    }
+    else if (CMTimeCompare(startTime, kCMTimeZero)==0) {
         [assetWriter startSessionAtSourceTime:frameTime];
         startTime = frameTime;
     }
@@ -544,15 +605,19 @@ NSString *const kGPUImageColorSwizzlingFragmentShaderString = SHADER_STRING
             glReadPixels(0, 0, videoSize.width, videoSize.height, GL_RGBA, GL_UNSIGNED_BYTE, pixelBufferData);
         }
     }
-        
-//    if(![assetWriterPixelBufferInput appendPixelBuffer:pixel_buffer withPresentationTime:CMTimeSubtract(frameTime, startTime)]) 
-    if(![assetWriterPixelBufferInput appendPixelBuffer:pixel_buffer withPresentationTime:frameTime]) 
+    
+    CMTime time = CMTimeSubtract(frameTime, startTime);
+    time = CMTimeAdd(time, originalTime);
+    time = CMTimeAdd(time, durationTime);
+    if(![assetWriterPixelBufferInput appendPixelBuffer:pixel_buffer withPresentationTime:time])
+    //if(![assetWriterPixelBufferInput appendPixelBuffer:pixel_buffer withPresentationTime:frameTime])
     {
-        NSLog(@"Problem appending pixel buffer at time: %lld", frameTime.value);
+        //NSLog(@"Problem appending pixel buffer at time: %lld", frameTime.value);
     } 
     else 
     {
-//        NSLog(@"Recorded video sample time: %lld, %d, %lld", frameTime.value, frameTime.timescale, frameTime.epoch);
+        //NSLog(@"Recorded video sample time: %lld, %d, %lld", frameTime.value, frameTime.timescale, frameTime.epoch)
+        //NSLog(@"Recorded video sample time: %f", 1.0*time.value/time.timescale);
     }
     CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
     
